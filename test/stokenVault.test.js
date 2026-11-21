@@ -139,7 +139,10 @@ test("cookie exchange returns only a bindable Cookie", async () => {
       captured = { url, options }
       return {
         ok: true,
-        json: async () => ({ retcode: 0, data: { cookie_token: "fixture-cookie-not-real" } }),
+        json: async () => ({
+          retcode: 0,
+          data: { ltoken: "fixture-ltoken-not-real", cookie_token: "fixture-cookie-not-real" },
+        }),
       }
     },
   )
@@ -147,7 +150,7 @@ test("cookie exchange returns only a bindable Cookie", async () => {
   assert.match(captured.options.cookie, /^stoken=fixture-stoken-not-real;/)
   assert.equal(
     cookie,
-    "ltoken=fixture-stoken-not-real;ltuid=fixture-account-a;cookie_token=fixture-cookie-not-real",
+    "ltoken=fixture-ltoken-not-real;ltuid=fixture-account-a;cookie_token=fixture-cookie-not-real",
   )
   assert.doesNotMatch(cookie, /stoken=/)
 })
@@ -165,7 +168,10 @@ test("legacy exchange normalizes stoken_v2", async () => {
       captured = { url, options }
       return {
         ok: true,
-        json: async () => ({ retcode: 0, data: { cookie_token: "fixture-cookie-not-real" } }),
+        json: async () => ({
+          retcode: 0,
+          data: { ltoken: "fixture-ltoken-not-real", cookie_token: "fixture-cookie-not-real" },
+        }),
       }
     },
   )
@@ -218,7 +224,7 @@ test("App QR fixture parses and saves an explicitly named fake Stoken", async t 
   await completeCredentialFlow(account, {
     exchange: async () =>
       "ltoken=fixture-stoken-json-not-real;ltuid=fixture-account-app-qr-stoken;cookie_token=fixture-cookie-app-qr-not-real",
-    bind: async () => {},
+    bind: async () => "success",
     save: value => vault.save(ownerId, value),
   })
 
@@ -260,7 +266,7 @@ test("credential flow validates and binds before replacing an existing vault rec
         exchange: async () => {
           throw new Error("fictional exchange failure")
         },
-        bind: async () => {},
+        bind: async () => "success",
         save: value => vault.save(ownerId, value),
       }),
     /fictional exchange failure/,
@@ -276,7 +282,7 @@ test("credential flow validates and binds before replacing an existing vault rec
         },
         save: value => vault.save(ownerId, value),
       }),
-    /fictional bind failure/,
+    { stage: "bind", kind: "rejected" },
   )
   assert.equal((await vault.readAccounts(ownerId))[0].token, original.token)
 
@@ -286,7 +292,10 @@ test("credential flow validates and binds before replacing an existing vault rec
       order.push("exchange")
       return "fixture-bind-cookie-not-real"
     },
-    bind: async () => order.push("bind"),
+    bind: async () => {
+      order.push("bind")
+      return "success"
+    },
     save: async value => {
       order.push("save")
       await vault.save(ownerId, value)
@@ -301,12 +310,16 @@ test("concurrent Cookie refreshes share one exchange per owner and account", asy
   let resolveRequest
   const requester = async () => {
     requests++
-    await new Promise(resolve => {
-      resolveRequest = resolve
-    })
+    if (requests === 1)
+      await new Promise(resolve => {
+        resolveRequest = resolve
+      })
     return {
       ok: true,
-      json: async () => ({ retcode: 0, data: { cookie_token: "fixture-cookie-not-real" } }),
+      json: async () => ({
+        retcode: 0,
+        data: { ltoken: "fixture-ltoken-not-real", cookie_token: "fixture-cookie-not-real" },
+      }),
     }
   }
   const account = {
@@ -345,4 +358,27 @@ test("credential logs contain only field names and status", () => {
   assert.doesNotMatch(error, /fixture-error-uid|fixture-error-token-not-real/)
   assert.match(output, /^status=received fields=/)
   assert.match(error, /^status=failed fields=/)
+})
+
+test("App QR token type 1 is parsed as Stoken", () => {
+  const account = parseLoginStokenAccount({
+    tokens: [{ token_type: 1, token: "app-stoken" }],
+    user_info: { aid: "10001", mid: "mid-10001" },
+  })
+
+  assert.deepEqual(account, {
+    accountId: "10001",
+    mid: "mid-10001",
+    token: "app-stoken",
+    tokenName: "stoken",
+  })
+})
+
+test("unrelated numeric token types are not treated as Stoken", () => {
+  const account = parseLoginStokenAccount({
+    tokens: [{ token_type: 2, token: "other-token" }],
+    user_info: { aid: "10002", mid: "mid-10002" },
+  })
+
+  assert.equal(account, null)
 })

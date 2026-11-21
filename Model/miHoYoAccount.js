@@ -1,3 +1,4 @@
+import crypto from "node:crypto"
 const refreshExchanges = new Map()
 
 export const MIHOYO_LOGIN_REGEX = "^#?(米哈?游社?登(录|陆|入)|登(录|陆|入)米哈?游社?)"
@@ -23,11 +24,11 @@ export function redactLogValue(data) {
 }
 
 export function redactLogError(error) {
-  const fields = new Set(["name", "message"])
-  if (error && typeof error === "object") {
-    for (const key of Object.keys(error)) fields.add(key)
-  }
-  return `status=failed fields=${[...fields].sort().join(",")}`
+  const stage = stages.has(error?.stage) ? error.stage : "unknown"
+  const kind = kinds.has(error?.kind) ? error.kind : "unknown"
+  const code =
+    typeof error?.retcode === "number" && Number.isFinite(error.retcode) ? error.retcode : "none"
+  return "status=failed fields=name,message stage=" + stage + " kind=" + kind + " retcode=" + code
 }
 
 export function isPrivateMessage(event) {
@@ -41,9 +42,12 @@ export function stokenCookie(account) {
 
 export function parseLoginStokenAccount(data) {
   if (!Array.isArray(data?.tokens) || !data?.user_info) return null
-  const token = ["stoken_v2", "stoken"]
+  const namedToken = ["stoken_v2", "stoken"]
     .map(name => data.tokens.find(item => item?.name === name && typeof item.token === "string"))
     .find(item => item?.token)
+  const token =
+    namedToken ??
+    data.tokens.find(item => Number(item?.token_type) === 1 && typeof item.token === "string")
   if (!token) return null
 
   const accountId = String(
@@ -57,7 +61,12 @@ export function parseLoginStokenAccount(data) {
     data.user_info.mid ?? data.user_info.account_mid_v2 ?? data.user_info.ltmid_v2 ?? "",
   )
   if (!accountId || !mid) return null
-  return { accountId, mid, token: token.token, tokenName: token.name }
+  return {
+    accountId,
+    mid,
+    token: token.token,
+    tokenName: token.name ?? "stoken",
+  }
 }
 
 export function classifyBindingReply(message) {
@@ -67,26 +76,86 @@ export function classifyBindingReply(message) {
   return "pending"
 }
 
-export async function exchangeCookieAccount(
-  account,
-  requester = (url, { cookie }) => globalThis.fetch(url, { headers: { Cookie: cookie } }),
-) {
-  const cookie = stokenCookie(account)
-  const query = new URLSearchParams({
-    stoken: account.token,
-    uid: account.accountId,
-    mid: account.mid,
-  })
-  const response = await requester(
-    `https://passport-api.mihoyo.com/account/auth/api/getCookieAccountInfoBySToken?${query}`,
-    { cookie },
+const stages = new Set(["ltoken", "cookie", "bind", "save", "exchange"])
+const kinds = new Set(["network", "http", "response", "rejected", "timeout", "storage"])
+export function credentialError(stage, kind, retcode) {
+  const error = new Error("credential operation failed")
+  error.stage = stages.has(stage) ? stage : "exchange"
+  error.kind = kinds.has(kind) ? kind : "response"
+  if (typeof retcode === "number" && Number.isFinite(retcode)) error.retcode = retcode
+  return error
+}
+export function credentialFailureMessage(error) {
+  if (error?.stage === "save") return "Cookie 已绑定，但 Stoken 加密保存失败；请检查存储状态。"
+  if (error?.stage === "bind")
+    return error.kind === "timeout"
+      ? "已获取 Stoken 和 Cookie，但未能确认绑定结果（等待超时）；原有 Stoken 未替换。"
+      : "已获取 Stoken 和 Cookie，但 Cookie 绑定失败；原有 Stoken 未替换。"
+  return "已获取 Stoken，但 Cookie 凭据转换失败；原有 Stoken 未替换，请稍后重新扫码。"
+}
+export function buildMysCookie(account, ltoken, cookieToken) {
+  const { accountId: uid, mid } = account
+  const parts = ltoken.startsWith("v2_")
+    ? ["ltoken_v2=" + ltoken, "ltuid_v2=" + uid, "ltmid_v2=" + mid]
+    : ["ltoken=" + ltoken, "ltuid=" + uid]
+  parts.push(
+    ...(cookieToken.startsWith("v2_")
+      ? ["cookie_token_v2=" + cookieToken, "account_id_v2=" + uid, "account_mid_v2=" + mid]
+      : ["cookie_token=" + cookieToken]),
   )
-  if (!response.ok) throw new Error("cookie exchange request failed")
-  const result = await response.json()
-  if (result.retcode !== 0 || !result.data?.cookie_token) {
-    throw new Error(result.message || "stoken is invalid")
+  return parts.join(";")
+}
+export async function exchangeCookieAccount(account, requester) {
+  if (typeof requester !== "function") throw credentialError("exchange", "response")
+  const cookie = stokenCookie(account)
+  const deviceId = crypto.randomUUID().replaceAll("-", "")
+  async function exchange(stage, endpoint, query, clientType, field) {
+    let response
+    try {
+      response = await requester(
+        "https://passport-api.mihoyo.com/account/auth/api/" +
+          endpoint +
+          "?" +
+          new URLSearchParams(query),
+        { cookie, clientType, deviceId },
+      )
+    } catch {
+      throw credentialError(stage, "network")
+    }
+    if (!response.ok) throw credentialError(stage, "http", response.status)
+    let result
+    try {
+      result = await response.json()
+    } catch {
+      throw credentialError(stage, "response")
+    }
+    if (
+      Number(result?.retcode) !== 0 ||
+      typeof result?.data?.[field] !== "string" ||
+      !result.data[field]
+    )
+      throw credentialError(
+        stage,
+        "rejected",
+        typeof result?.retcode === "number" ? result.retcode : undefined,
+      )
+    return result.data[field]
   }
-  return `ltoken=${account.token};ltuid=${account.accountId};cookie_token=${result.data.cookie_token}`
+  const ltoken = await exchange(
+    "ltoken",
+    "getLTokenBySToken",
+    { stoken: account.token, stuid: account.accountId },
+    5,
+    "ltoken",
+  )
+  const cookieToken = await exchange(
+    "cookie",
+    "getCookieAccountInfoBySToken",
+    { stoken: account.token, uid: account.accountId, mid: account.mid },
+    2,
+    "cookie_token",
+  )
+  return buildMysCookie(account, ltoken, cookieToken)
 }
 
 export function exchangeCookieAccountOnce(ownerId, account, requester) {
@@ -105,7 +174,18 @@ export function exchangeCookieAccountOnce(ownerId, account, requester) {
 
 export async function completeCredentialFlow(account, { exchange, bind, save }) {
   const cookie = await exchange(account)
-  await bind(cookie)
-  await save(account)
+  let result
+  try {
+    result = await bind(cookie)
+  } catch {
+    throw credentialError("bind", "rejected")
+  }
+  if (result !== "success")
+    throw credentialError("bind", result === "timeout" ? "timeout" : "rejected")
+  try {
+    await save(account)
+  } catch {
+    throw credentialError("save", "storage")
+  }
   return cookie
 }

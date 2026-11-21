@@ -8,6 +8,7 @@ import {
   MIHOYO_QR_LOGIN_REGEX,
   classifyBindingReply,
   completeCredentialFlow,
+  credentialFailureMessage,
   exchangeCookieAccount,
   exchangeCookieAccountOnce,
   isPrivateMessage,
@@ -44,14 +45,16 @@ function md5(data) {
   return crypto.createHash("md5").update(data).digest("hex")
 }
 
-function ds(data) {
+function ds(data, clientType = 2) {
   const t = Math.floor(Date.now() / 1000)
   const r = random_string(6)
-  const h = md5(`salt=JwYDpKvLj6MrMqqYU6jTKF17KNO2PXoS&t=${t}&r=${r}&b=${data}&q=`)
+  const salt =
+    clientType === 5 ? "xV8v4Qu54lUKrEYFZkJhB8cuOh9Asafs" : "JwYDpKvLj6MrMqqYU6jTKF17KNO2PXoS"
+  const h = md5(`salt=${salt}&t=${t}&r=${r}&b=${data}&q=`)
   return `${t},${r},${h}`
 }
 
-function request(url, { data, aigis, cookie } = {}) {
+function request(url, { data, aigis, cookie, clientType = 2, deviceId } = {}) {
   const opts = {}
   if (data) {
     opts.method = "post"
@@ -59,21 +62,22 @@ function request(url, { data, aigis, cookie } = {}) {
   }
   opts.headers = {
     "x-rpc-app_version": "2.104.0",
-    DS: ds(opts.body ?? ""),
+    DS: ds(opts.body ?? "", clientType),
     "x-rpc-aigis": aigis,
     "Content-Type": "application/json",
     Accept: "application/json",
     "x-rpc-game_biz": "bbs_cn",
     "x-rpc-sys_version": "12",
-    "x-rpc-device_id": random_string(16),
+    "x-rpc-device_id": deviceId ?? random_string(16),
     "x-rpc-device_fp": random_string(13),
     "x-rpc-device_name": random_string(16),
     "x-rpc-device_model": random_string(16),
     "x-rpc-app_id": "bll8iq97cem8",
-    "x-rpc-client_type": "2",
+    "x-rpc-client_type": String(clientType),
     "User-Agent": "Hyperion/550 CFNetwork/3860.500.112 Darwin/25.4.0",
     Cookie: cookie,
   }
+  opts.signal = AbortSignal.timeout(20000)
   return fetch(url, opts)
 }
 
@@ -260,13 +264,13 @@ export class miHoYoLogin extends plugin {
           if (res.data.login_ticket) cookie += `;login_ticket=${res.data.login_ticket}`
           return cookie
         },
-        bind: cookie => this.makeMessage(cookie),
+        bind: cookie => this.makeMessage(cookie, { waitForBinding: true }),
         save: account => stokenVault.save(this.e.user_id, account),
       })
       this.reply("登录完成，Cookie 已自动绑定，Stoken 已加密保存")
     } catch (err) {
       logger.error("[米哈游登录]", safeError(err))
-      this.reply(errorTips, true, { recallMsg: 60 })
+      this.reply(credentialFailureMessage(err), true, { recallMsg: 60 })
     } finally {
       Running[this.e.user_id] = false
     }
@@ -390,21 +394,28 @@ export class miHoYoLogin extends plugin {
     Running[this.e.user_id] = false
 
     try {
+      if (res?.data?.status !== "Confirmed")
+        return this.reply("扫码登录等待超时，请重新扫码；已保存凭据未修改。", true, {
+          recallMsg: 60,
+        })
       if (!(res.data?.tokens && res.data?.user_info))
         return this.reply(errorTips, true, { recallMsg: 60 })
 
       const account = parseLoginStokenAccount(res.data)
-      if (!account) return this.reply(errorTips, true, { recallMsg: 60 })
+      if (!account)
+        return this.reply("扫码已确认，但未取得完整 Stoken；已保存凭据未修改。", true, {
+          recallMsg: 60,
+        })
 
       await completeCredentialFlow(account, {
         exchange: value => exchangeCookieAccount(value, request),
-        bind: cookie => this.makeMessage(cookie),
+        bind: cookie => this.makeMessage(cookie, { waitForBinding: true }),
         save: value => stokenVault.save(this.e.user_id, value),
       })
       this.reply("登录完成，Cookie 已自动绑定，Stoken 已加密保存")
     } catch (err) {
       logger.error("[米哈游登录]", safeError(err))
-      return this.reply(errorTips, true, { recallMsg: 60 })
+      return this.reply(credentialFailureMessage(err), true, { recallMsg: 60 })
     }
   }
 
